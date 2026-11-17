@@ -283,7 +283,11 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
       model.advance()
 
   def _observe_temperature(self, model) -> np.ndarray:
-    """Returns temperature in Kelvin with dimensions (level, lon, lat)."""
+    """Returns the temperature state in K with dimensions (level, lon, lat).
+
+    This is the deviation from the reference temperature of each level, which
+    is the quantity that the model holds in its prognostics.
+    """
     observed = model.observe(
         {PROGNOSTICS_KEY: {'temperature': self.nodal_volume}}
     )
@@ -302,11 +306,11 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
     atol = rtol * np.abs(expected_on_levels).max()
     np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol)
 
-  def _assert_at_rest(self, model) -> None:
+  def _assert_at_rest(self, model, atol: float = 1e-7) -> None:
     """Asserts that everything other than temperature and time is unchanged."""
     for k, v in model.prognostic_values().items():
       if k not in ('temperature', 'time'):
-        np.testing.assert_allclose(v.data, 0.0, atol=1e-5, err_msg=k)
+        np.testing.assert_allclose(v.data, 0.0, atol=atol, err_msg=k)
 
   @parameterized.named_parameters(
       dict(testcase_name='defaults', model_kwargs={}),
@@ -335,6 +339,8 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
                   time_integrators.SemiLagrangianCrankNicolsonRK2
               ),
           ),
+          # Interpolation to departure points leaves more numerical noise.
+          rest_atol=5e-6,
       ),
       dict(
           testcase_name='nondimensional_sim_units',
@@ -343,7 +349,7 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
       ),
   )
   def test_constant_heating_integrates_over_model_timestep(
-      self, model_kwargs, sim_units=units.SI_UNITS
+      self, model_kwargs, sim_units=units.SI_UNITS, rest_atol=1e-7
   ):
     model = self._make_model(
         self._heating(sim_units), sim_units=sim_units, **model_kwargs
@@ -352,7 +358,7 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
 
     expected = np.array(HEATING_RATES_SI) * _seconds(2 * ONE_HOUR)
     self._assert_uniform_on_levels(self._observe_temperature(model), expected)
-    self._assert_at_rest(model)
+    self._assert_at_rest(model, atol=rest_atol)
     observed_time = model.observe({PROGNOSTICS_KEY: {'time': cx.Scalar()}})
     self.assertEqual(
         observed_time[PROGNOSTICS_KEY]['time'].data.to_datetime64(),
@@ -404,7 +410,7 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
           held_for=ONE_HOUR,
       ),
       dict(
-          testcase_name='dycore_substeps_do_not_reevaluate',
+          testcase_name='tendency_held_across_dycore_substeps',
           model_kwargs=dict(dycore_substeps=4),
           evaluation_times=(3600,),
           held_for=ONE_HOUR,
@@ -453,7 +459,7 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
         self._heating(forcing=forcing),
         parameterization_timestep=QUARTER_HOUR,
     )
-    timedelta = coordinates.TimeDelta(np.array([0, 30], 'timedelta64[m]'))
+    timedelta = coordinates.TimeDelta(np.array([0, 20], 'timedelta64[m]'))
     forcing_times = self.init_time + jdt.to_timedelta(timedelta.deltas)
     model.update_dynamic_inputs({
         FORCING_KEY: {
@@ -463,8 +469,8 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
     })
     self._advance_from_rest(model)
 
-    # The most recent forcing slice is used: 1 at 0 and 15 minutes, 3 at 30 and
-    # 45 minutes.
+    # The most recent forcing slice is used, not the nearest one: 1 at 0 and
+    # 15 minutes, 3 at 30 and 45 minutes.
     expected = np.array(HEATING_RATES_SI) * (1 + 1 + 3 + 3) * 900
     self._assert_uniform_on_levels(self._observe_temperature(model), expected)
 
@@ -510,13 +516,13 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
     self.assertSameElements(actual, expected)
     for k in ('divergence', 'vorticity', 'temperature', 'specific_humidity'):
       with self.subTest(k):
-        scale = np.abs(expected[k].data).max()
-        self.assertGreater(scale, 0.0)
+        # Tolerance is relative to how much the field changed over the step,
+        # so that a model that did not evolve the state would not pass.
+        change = np.abs(expected[k].data - state[k].data).max()
+        self.assertGreater(change, 0.0)
         np.testing.assert_allclose(
-            actual[k].data, expected[k].data, atol=1e-4 * scale
+            actual[k].data, expected[k].data, atol=1e-3 * change
         )
-    # The state must have evolved for the comparison to be meaningful.
-    self.assertGreater(np.abs(actual['divergence'].data).max(), 0.0)
 
   def test_diagnostic_stages_see_documented_inputs(self):
     def make(name: str, from_prognostics: bool):
@@ -598,8 +604,9 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
     ylm_map = self._ylm_map(sim_units)
     offset_rate = 5e-4
     offset = ylm_map.to_modal(
-        cx.field(jnp.full(self.nodal_volume.shape, offset_rate),
-                 self.nodal_volume)
+        cx.field(
+            jnp.full(self.nodal_volume.shape, offset_rate), self.nodal_volume
+        )
     )
     model = self._make_model(
         self._heating(),
@@ -632,7 +639,7 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
   def test_energy_balance_fixer_converts_imbalance_to_heating(self, sim_units):
     ylm_map = self._ylm_map(sim_units)
     # Uniform nondimensional column energy imbalance. Surface pressure of the
-    # resting state is exp(0) = 1 in nondimensional units.
+    # resting state is exp(0) = 1 in simulation units for any `sim_units`.
     imbalance = 1e-3
     model = self._make_model(
         _zero_tendencies,
@@ -659,7 +666,17 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
     expected = np.full(len(HEATING_RATES_SI), heating * dt)
     self._assert_uniform_on_levels(self._observe_temperature(model), expected)
 
-  def test_state_fixers_modify_state_after_dycore_step(self):
+  @parameterized.named_parameters(
+      # Restoring temperature from the start of each step undoes all heating.
+      dict(testcase_name='set', fixer_cls=_SetTemperature, expected_steps=0),
+      # Adding temperature from the start of each step gives
+      # T[n + 1] = 2 * T[n] + rates * dt, i.e. T[4] = 15 * rates * dt. A fixer
+      # that saw diagnostics of the previous step would give 7 * rates * dt.
+      dict(testcase_name='add', fixer_cls=_AddToTemperature, expected_steps=15),
+  )
+  def test_state_fixers_modify_state_after_dycore_step(
+      self, fixer_cls, expected_steps
+  ):
     model = self._make_model(
         self._heating(),
         parameterization_timestep=QUARTER_HOUR,
@@ -669,12 +686,17 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
                 extract_coords={'start': self.modal_volume},
             ),
         },
-        state_fixers=[_SetTemperature('start', self.modal_volume)],
+        state_fixers=[fixer_cls('start', self.modal_volume)],
     )
     self._advance_from_rest(model)
 
-    # Restoring temperature from the start of each step undoes all heating.
-    np.testing.assert_allclose(self._observe_temperature(model), 0.0, atol=1e-6)
+    rates = np.array(HEATING_RATES_SI)
+    expected = rates * expected_steps * _seconds(QUARTER_HOUR)
+    actual = self._observe_temperature(model)
+    if expected_steps:
+      self._assert_uniform_on_levels(actual, expected)
+    else:
+      np.testing.assert_allclose(actual, 0.0, atol=1e-4 * rates.min() * 900)
 
   @parameterized.named_parameters(
       dict(testcase_name='no_remat', remat_kwargs={}),
@@ -699,7 +721,7 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
         **remat_kwargs,
     )
     inputs = {NONDIM_PROGNOSTICS_KEY: self._resting_state()}
-    level_weights = jnp.arange(1.0, 5.0)
+    level_weights = jnp.arange(1.0, 1.0 + len(HEATING_RATES_SI))
 
     def loss(model):
       model.assimilate(inputs)
@@ -709,7 +731,7 @@ class LearnedParameterizationSpectralDycoreTest(parameterized.TestCase):
       )
       return jnp.sum(level_weights * jnp.mean(temperature.data, axis=(1, 2)))
 
-    grads = nnx.grad(loss)(model)
+    grads = nnx.jit(nnx.grad(loss))(model)
 
     # Temperature on each level is `rate * 3600`, so the gradient with respect
     # to the heating rate on level `i` is `level_weights[i] * 3600`.
